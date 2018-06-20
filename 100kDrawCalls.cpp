@@ -4,207 +4,216 @@
 #include <vector>
 #include <algorithm>
 #include <execution>
-#include <immintrin.h>
+#include <dxgi1_4.h>
+#include <d3d12.h>
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "d3dx12.h"
+#pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dxgi.lib")
 
+#define VHR(hr) if (FAILED(hr)) { assert(0); }
+#define SAFE_RELEASE(obj) if ((obj)) { (obj)->Release(); (obj) = nullptr; }
 
-#define k_DemoName "100k Draw Calls Bench (CPU, AVX2, Double-precision)"
+#define k_DemoName "100k Draw Calls in Parallel"
 #define k_DemoResolutionX 1280
 #define k_DemoResolutionY 720
 
-struct alignas(32) ComplexPacket
-{
-    __m256d re, im;
-};
-
 struct Demo
 {
-    double zoom;
-    double position[2];
+    ID3D12Device* device;
+    ID3D12CommandQueue* cmdQueue;
+    ID3D12CommandAllocator* cmdAlloc[2];
+    ID3D12GraphicsCommandList* cmdList;
+    IDXGISwapChain3* swapChain;
+    ID3D12DescriptorHeap* swapBufferHeap;
+    D3D12_CPU_DESCRIPTOR_HANDLE swapBufferHeapStart;
+    ID3D12Resource* swapBuffers[4];
+    ID3D12Fence* frameFence;
+    HANDLE frameFenceEvent;
     HWND window;
-    HDC windowDevCtx;
-    HDC memoryDevCtx;
-    uint8_t* displayPtr;
+    uint32_t descriptorSize;
+    uint32_t descriptorSizeRtv;
+    uint32_t frameIndex;
+    uint32_t backBufferIndex;
+    uint64_t frameCount;
+    ID3D12PipelineState* pso;
+    ID3D12RootSignature* rootSig;
 };
 
-static __m256d s_0_5;
-static __m256d s_1_0;
-static __m256d s_100_0;
-
-#include "Pch.h"
-#include "Renderer.h"
-
-
-Renderer *s_Renderer;
-
-Renderer::Renderer(HWND hwnd)
+// returns [0.0f, 1.0f)
+static inline float
+Randomf()
 {
-	IDXGIFactory4 *factory;
+    const uint32_t exponent = 127;
+    const uint32_t significand = (uint32_t)(rand() & 0x7fff); // get 15 random bits
+    const uint32_t result = (exponent << 23) | (significand << 8);
+    return *(float*)&result - 1.0f;
+}
+
+static inline float
+Randomf(float begin, float end)
+{
+    assert(begin < end);
+    return begin + (end - begin) * Randomf();
+}
+
+static std::vector<uint8_t>
+LoadFile(const char* fileName)
+{
+    FILE* file = fopen(fileName, "rb");
+    assert(file);
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    assert(size != -1);
+    std::vector<uint8_t> content(size);
+    fseek(file, 0, SEEK_SET);
+    fread(&content[0], 1, content.size(), file);
+    fclose(file);
+    return content;
+}
+
+static void
+InitializeDx12(Demo& demo)
+{
+    IDXGIFactory4* factory;
 #ifdef _DEBUG
-	VHR(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, IID_PPV_ARGS(&factory)));
+    VHR(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, IID_PPV_ARGS(&factory)));
 #else
-	VHR(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
+    VHR(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
 #endif
 
 #ifdef _DEBUG
-	{
-		ID3D12Debug *dbg;
-		D3D12GetDebugInterface(IID_PPV_ARGS(&dbg));
-		if (dbg)
-		{
-			dbg->EnableDebugLayer();
-			ID3D12Debug1 *dbg1;
-			dbg->QueryInterface(IID_PPV_ARGS(&dbg1));
-			if (dbg1)
-				dbg1->SetEnableGPUBasedValidation(TRUE);
-			SAFE_RELEASE(dbg);
-			SAFE_RELEASE(dbg1);
-		}
-	}
+    {
+        ID3D12Debug* dbg;
+        D3D12GetDebugInterface(IID_PPV_ARGS(&dbg));
+        if (dbg)
+        {
+            dbg->EnableDebugLayer();
+            ID3D12Debug1* dbg1;
+            dbg->QueryInterface(IID_PPV_ARGS(&dbg1));
+            if (dbg1)
+                dbg1->SetEnableGPUBasedValidation(TRUE);
+            SAFE_RELEASE(dbg);
+            SAFE_RELEASE(dbg1);
+        }
+    }
 #endif
-	if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_1, IID_PPV_ARGS(&Gpu))))
-	{
-		// #TODO: Add MessageBox
-		return;
-	}
+    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_1, IID_PPV_ARGS(&demo.device))))
+    {
+        // #TODO: Add MessageBox
+        return;
+    }
 
-	D3D12_COMMAND_QUEUE_DESC cmdQueueDesc = {};
-	cmdQueueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-	cmdQueueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-	cmdQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-	VHR(Gpu->CreateCommandQueue(&cmdQueueDesc, IID_PPV_ARGS(&CmdQueue)));
+    D3D12_COMMAND_QUEUE_DESC cmdQueueDesc = {};
+    cmdQueueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    cmdQueueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    cmdQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    VHR(demo.device->CreateCommandQueue(&cmdQueueDesc, IID_PPV_ARGS(&demo.cmdQueue)));
 
-	DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
-	swapChainDesc.BufferCount = 4;
-	swapChainDesc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-	swapChainDesc.OutputWindow = hwnd;
-	swapChainDesc.SampleDesc.Count = 1;
-	swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-	swapChainDesc.Windowed = TRUE;
+    DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
+    swapChainDesc.BufferCount = 4;
+    swapChainDesc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swapChainDesc.OutputWindow = demo.window;
+    swapChainDesc.SampleDesc.Count = 1;
+    swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    swapChainDesc.Windowed = TRUE;
 
-	IDXGISwapChain *tempSwapChain;
-	VHR(factory->CreateSwapChain(CmdQueue, &swapChainDesc, &tempSwapChain));
-	VHR(tempSwapChain->QueryInterface(IID_PPV_ARGS(&m_SwapChain)));
-	SAFE_RELEASE(tempSwapChain);
-	SAFE_RELEASE(factory);
+    IDXGISwapChain* tempSwapChain;
+    VHR(factory->CreateSwapChain(demo.cmdQueue, &swapChainDesc, &tempSwapChain));
+    VHR(tempSwapChain->QueryInterface(IID_PPV_ARGS(&demo.swapChain)));
+    SAFE_RELEASE(tempSwapChain);
+    SAFE_RELEASE(factory);
 
-	for (uint32_t i = 0; i < 2; ++i)
-		VHR(Gpu->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_CmdAlloc[i])));
+    for (uint32_t i = 0; i < 2; ++i)
+        VHR(demo.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&demo.cmdAlloc[i])));
 
-	DescriptorSize = Gpu->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-	DescriptorSizeRtv = Gpu->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    demo.descriptorSize = demo.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    demo.descriptorSizeRtv = demo.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
-	/* swap buffers */ {
-		D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-		heapDesc.NumDescriptors = 4;
-		heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-		heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-		VHR(Gpu->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_SwapBufferHeap)));
-		m_SwapBufferHeapStart = m_SwapBufferHeap->GetCPUDescriptorHandleForHeapStart();
+    /* swap buffers */ {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = 4;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        VHR(demo.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&demo.swapBufferHeap)));
+        demo.swapBufferHeapStart = demo.swapBufferHeap->GetCPUDescriptorHandleForHeapStart();
 
-		CD3DX12_CPU_DESCRIPTOR_HANDLE handle(m_SwapBufferHeapStart);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE handle(demo.swapBufferHeapStart);
 
-		for (uint32_t i = 0; i < 4; ++i)
-		{
-			VHR(m_SwapChain->GetBuffer(i, IID_PPV_ARGS(&m_SwapBuffers[i])));
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            VHR(demo.swapChain->GetBuffer(i, IID_PPV_ARGS(&demo.swapBuffers[i])));
 
-			Gpu->CreateRenderTargetView(m_SwapBuffers[i], nullptr, handle);
-			handle.Offset(DescriptorSizeRtv);
-		}
-	}
-	/* depth buffer */ {
-		D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-		heapDesc.NumDescriptors = 1;
-		heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-		heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-		VHR(Gpu->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_DepthBufferHeap)));
-		m_DepthBufferHeapStart = m_DepthBufferHeap->GetCPUDescriptorHandleForHeapStart();
+            demo.device->CreateRenderTargetView(demo.swapBuffers[i], nullptr, handle);
+            handle.Offset(demo.descriptorSizeRtv);
+        }
+    }
 
-		RECT r;
-		GetClientRect(hwnd, &r);
-		CD3DX12_RESOURCE_DESC imageDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, r.right - r.left, r.bottom - r.top);
-		imageDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
-		VHR(Gpu->CreateCommittedResource(
-			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT), D3D12_HEAP_FLAG_NONE,
-			&imageDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE,
-			&CD3DX12_CLEAR_VALUE(DXGI_FORMAT_D32_FLOAT, 1.0f, 0), IID_PPV_ARGS(&DepthBuffer)));
+    VHR(demo.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, demo.cmdAlloc[0], nullptr, IID_PPV_ARGS(&demo.cmdList)));
+    VHR(demo.cmdList->Close());
 
-		D3D12_DEPTH_STENCIL_VIEW_DESC viewDesc = {};
-		viewDesc.Format = DXGI_FORMAT_D32_FLOAT;
-		viewDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-		viewDesc.Flags = D3D12_DSV_FLAG_NONE;
-		Gpu->CreateDepthStencilView(DepthBuffer, &viewDesc, m_DepthBufferHeapStart);
-	}
-
-	VHR(Gpu->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_CmdAlloc[0], nullptr, IID_PPV_ARGS(&CmdList)));
-	VHR(CmdList->Close());
-
-	VHR(Gpu->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_FrameFence)));
-	m_FrameFenceEvent = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+    VHR(demo.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&demo.frameFence)));
+    demo.frameFenceEvent = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
 }
 
-Renderer::~Renderer()
+static void
+Shutdown(Demo& demo)
 {
-	SAFE_RELEASE(CmdList);
-	SAFE_RELEASE(m_CmdAlloc[0]);
-	SAFE_RELEASE(m_CmdAlloc[1]);
-	SAFE_RELEASE(m_SwapBufferHeap);
-	SAFE_RELEASE(m_DepthBufferHeap);
-	SAFE_RELEASE(DepthBuffer);
-	for (int i = 0; i < 4; ++i)
-		SAFE_RELEASE(m_SwapBuffers[i]);
-	CloseHandle(m_FrameFenceEvent);
-	SAFE_RELEASE(m_FrameFence);
-	SAFE_RELEASE(m_SwapChain);
-	SAFE_RELEASE(CmdQueue);
-	SAFE_RELEASE(Gpu);
+    SAFE_RELEASE(demo.cmdList);
+    SAFE_RELEASE(demo.cmdAlloc[0]);
+    SAFE_RELEASE(demo.cmdAlloc[1]);
+    SAFE_RELEASE(demo.swapBufferHeap);
+    for (int i = 0; i < 4; ++i)
+        SAFE_RELEASE(demo.swapBuffers[i]);
+    CloseHandle(demo.frameFenceEvent);
+    SAFE_RELEASE(demo.frameFence);
+    SAFE_RELEASE(demo.swapChain);
+    SAFE_RELEASE(demo.cmdQueue);
+    SAFE_RELEASE(demo.device);
 }
 
-void Renderer::Present()
+static void
+Present(Demo& demo)
 {
-	assert(CmdQueue);
+    demo.swapChain->Present(0, 0);
+    demo.cmdQueue->Signal(demo.frameFence, ++demo.frameCount);
 
-	m_SwapChain->Present(0, 0);
-	CmdQueue->Signal(m_FrameFence, ++m_FrameCount);
+    const uint64_t deviceFrameCount = demo.frameFence->GetCompletedValue();
 
-	const uint64_t gpuFrameCount = m_FrameFence->GetCompletedValue();
+    if ((demo.frameCount - deviceFrameCount) >= 2)
+    {
+        demo.frameFence->SetEventOnCompletion(deviceFrameCount + 1, demo.frameFenceEvent);
+        WaitForSingleObject(demo.frameFenceEvent, INFINITE);
+    }
 
-	if ((m_FrameCount - gpuFrameCount) >= 2)
-	{
-		m_FrameFence->SetEventOnCompletion(gpuFrameCount + 1, m_FrameFenceEvent);
-		WaitForSingleObject(m_FrameFenceEvent, INFINITE);
-	}
-
-	m_FrameIndex = !m_FrameIndex;
-	m_BackBufferIndex = m_SwapChain->GetCurrentBackBufferIndex();
+    demo.frameIndex = !demo.frameIndex;
+    demo.backBufferIndex = demo.swapChain->GetCurrentBackBufferIndex();
 }
 
-void Renderer::Flush()
+static void
+Flush(Demo& demo)
 {
-	assert(CmdQueue);
-
-	CmdQueue->Signal(m_FrameFence, ++m_FrameCount);
-	m_FrameFence->SetEventOnCompletion(m_FrameCount, m_FrameFenceEvent);
-	WaitForSingleObject(m_FrameFenceEvent, INFINITE);
+    demo.cmdQueue->Signal(demo.frameFence, ++demo.frameCount);
+    demo.frameFence->SetEventOnCompletion(demo.frameCount, demo.frameFenceEvent);
+    WaitForSingleObject(demo.frameFenceEvent, INFINITE);
 }
-
 
 static double
 GetTime()
 {
-    static LARGE_INTEGER counter0;
+    static LARGE_INTEGER startCounter;
     static LARGE_INTEGER frequency;
-    if (counter0.QuadPart == 0)
+    if (startCounter.QuadPart == 0)
     {
         QueryPerformanceFrequency(&frequency);
-        QueryPerformanceCounter(&counter0);
+        QueryPerformanceCounter(&startCounter);
     }
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
-    return (counter.QuadPart - counter0.QuadPart) / (double)frequency.QuadPart;
+    return (counter.QuadPart - startCounter.QuadPart) / (double)frequency.QuadPart;
 }
 
 static void
@@ -257,7 +266,7 @@ ProcessWindowMessage(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 }
 
 static void
-Initialize(Demo& demo)
+InitializeWindow(Demo& demo)
 {
     WNDCLASS winclass = {};
     winclass.lpfnWndProc = ProcessWindowMessage;
@@ -277,95 +286,72 @@ Initialize(Demo& demo)
         rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, nullptr, 0);
     assert(demo.window);
-    demo.windowDevCtx = GetDC(demo.window);
-    assert(demo.windowDevCtx);
-
-    BITMAPINFO bi = {};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    bi.bmiHeader.biWidth = k_DemoResolutionX;
-    bi.bmiHeader.biHeight = k_DemoResolutionY;
-    bi.bmiHeader.biSizeImage = k_DemoResolutionX * k_DemoResolutionY;
-    HBITMAP hbm = CreateDIBSection(demo.windowDevCtx, &bi, DIB_RGB_COLORS, (void**)&demo.displayPtr, NULL, 0);
-    assert(hbm);
-
-    demo.memoryDevCtx = CreateCompatibleDC(demo.windowDevCtx);
-    assert(demo.memoryDevCtx);
-    SelectObject(demo.memoryDevCtx, hbm);
 }
 
-static __forceinline ComplexPacket
-ComplexPacketMul(ComplexPacket a, ComplexPacket b)
+static void
+Draw(Demo& demo)
 {
-    ComplexPacket ab;
+    ID3D12CommandAllocator* cmdAlloc = demo.cmdAlloc[demo.frameIndex];
+    ID3D12GraphicsCommandList* cl = demo.cmdList;
 
-    // ab.re = a.re * b.re - a.im * b.im;
-    ab.re = _mm256_sub_pd(_mm256_mul_pd(a.re, b.re), _mm256_mul_pd(a.im, b.im));
+    cmdAlloc->Reset();
+    cl->Reset(cmdAlloc, nullptr);
 
-    // ab.im = a.re * b.im + a.im * b.re;
-    ab.im = _mm256_add_pd(_mm256_mul_pd(a.re, b.im), _mm256_mul_pd(a.im, b.re));
+    cl->RSSetViewports(1, &CD3DX12_VIEWPORT(0.0f, 0.0f, (float)k_DemoResolutionX, (float)k_DemoResolutionY));
+    cl->RSSetScissorRects(1, &CD3DX12_RECT(0, 0, k_DemoResolutionX, k_DemoResolutionY));
 
-    return ab;
-}
+    cl->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(demo.swapBuffers[demo.backBufferIndex],
+                                                                 D3D12_RESOURCE_STATE_PRESENT,
+                                                                 D3D12_RESOURCE_STATE_RENDER_TARGET));
 
-static __forceinline ComplexPacket
-ComplexPacketSqr(ComplexPacket a)
-{
-    ComplexPacket aa;
+    D3D12_CPU_DESCRIPTOR_HANDLE backBufferDescriptor = CD3DX12_CPU_DESCRIPTOR_HANDLE(demo.swapBufferHeapStart,
+                                                                                     demo.backBufferIndex,
+                                                                                     demo.descriptorSizeRtv);
+    const float clearColor[4] = { 0.0f, 0.2f, 0.4f, 1.0f };
 
-    // aa.re = a.re * a.re - a.im * a.im;
-    aa.re = _mm256_sub_pd(_mm256_mul_pd(a.re, a.re), _mm256_mul_pd(a.im, a.im));
+    cl->OMSetRenderTargets(1, &backBufferDescriptor, 0, nullptr);
+    cl->ClearRenderTargetView(backBufferDescriptor, clearColor, 0, nullptr);
 
-    // aa.im = 2.0f * a.re * a.im;
-    aa.im = _mm256_mul_pd(_mm256_add_pd(a.re, a.re), a.im);
+    cl->SetPipelineState(demo.pso);
+    cl->SetGraphicsRootSignature(demo.rootSig);
+    cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
 
-    return aa;
-}
-
-static __m256d
-ComputeDistance(__m256d vcx, __m256d vcy, int bailout)
-{
-    ComplexPacket z = { _mm256_setzero_pd(), _mm256_setzero_pd() };
-    ComplexPacket dz = { s_1_0, _mm256_setzero_pd() };
-    __m256d m2, lessMask;
-
-    while (bailout--)
+    for (uint32_t i = 0; i < 100000; ++i)
     {
-        m2 = _mm256_add_pd(_mm256_mul_pd(z.re, z.re), _mm256_mul_pd(z.im, z.im));
-        lessMask = _mm256_cmp_pd(m2, s_100_0, _CMP_LE_OQ);
-        if (_mm256_movemask_pd(lessMask) == 0)
-            break;
-
-        ComplexPacket dzN = ComplexPacketMul(z, dz);
-        dzN.re = _mm256_add_pd(_mm256_add_pd(dzN.re, dzN.re), s_1_0);
-        dzN.im = _mm256_add_pd(dzN.im, dzN.im);
-
-        ComplexPacket zN = ComplexPacketSqr(z);
-        zN.re = _mm256_add_pd(zN.re, vcx);
-        zN.im = _mm256_add_pd(zN.im, vcy);
-
-        z.re = _mm256_blendv_pd(z.re, zN.re, lessMask);
-        z.im = _mm256_blendv_pd(z.im, zN.im, lessMask);
-        dz.re = _mm256_blendv_pd(dz.re, dzN.re, lessMask);
-        dz.im = _mm256_blendv_pd(dz.im, dzN.im, lessMask);
+        float p[2] = { Randomf(-0.7f, 0.7f), Randomf(-0.7f, 0.7f) };
+        cl->SetGraphicsRoot32BitConstants(0, 2, p, 0);
+        cl->DrawInstanced(1, 1, 0, 0);
     }
+    cl->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(demo.swapBuffers[demo.backBufferIndex],
+                                                                 D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                                 D3D12_RESOURCE_STATE_PRESENT));
+    VHR(cl->Close());
 
-    alignas(32) double logTemp[4];
-    _mm256_store_pd(logTemp, m2);
-    logTemp[0] = log(logTemp[0]);
-    logTemp[1] = log(logTemp[1]);
-    logTemp[2] = log(logTemp[2]);
-    logTemp[3] = log(logTemp[3]);
-    __m256d logRes = _mm256_load_pd(logTemp);
+    demo.cmdQueue->ExecuteCommandLists(1, (ID3D12CommandList**)&cl);
+}
 
-    __m256d dzDot2 = _mm256_add_pd(_mm256_mul_pd(dz.re, dz.re), _mm256_mul_pd(dz.im, dz.im));
+static void
+Initialize(Demo& demo)
+{
+    /* pso */ {
+        std::vector<uint8_t> vsCode = LoadFile("VsTransform.cso");
+        std::vector<uint8_t> psCode = LoadFile("PsShade.cso");
 
-    __m256d dist = _mm256_sqrt_pd(_mm256_div_pd(m2, dzDot2));
-    dist = _mm256_mul_pd(logRes, _mm256_mul_pd(dist, s_0_5));
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.VS = { vsCode.data(), vsCode.size() };
+        psoDesc.PS = { psCode.data(), psCode.size() };
+        psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psoDesc.SampleMask = 0xffffffff;
+        psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        psoDesc.NumRenderTargets = 1;
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        psoDesc.SampleDesc.Count = 1;
 
-    return _mm256_andnot_pd(lessMask, dist);
+        VHR(demo.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&demo.pso)));
+        VHR(demo.device->CreateRootSignature(0, vsCode.data(), vsCode.size(), IID_PPV_ARGS(&demo.rootSig)));
+    }
 }
 
 int CALLBACK
@@ -374,18 +360,9 @@ WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     SetProcessDPIAware();
 
     Demo demo = {};
+    InitializeWindow(demo);
+    InitializeDx12(demo);
     Initialize(demo);
-    demo.zoom = 0.8;
-    demo.position[0] = 0.5;
-    demo.position[1] = 0.1;
-
-    std::vector<uint32_t> tiles;
-    for (uint32_t i = 0; i < k_NumTiles; ++i)
-        tiles.push_back(i);
-
-    s_0_5 = _mm256_set1_pd(0.5);
-    s_1_0 = _mm256_set1_pd(1.0);
-    s_100_0 = _mm256_set1_pd(100.0);
 
     for (;;)
     {
@@ -400,81 +377,8 @@ WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         {
             double time, deltaTime;
             UpdateFrameTime(demo.window, time, deltaTime);
-
-            if (GetAsyncKeyState('A') & 0x8000)
-                demo.zoom -= deltaTime * demo.zoom;
-            if (GetAsyncKeyState('Z') & 0x8000)
-                demo.zoom += deltaTime * demo.zoom;
-
-            if (GetAsyncKeyState(VK_LEFT) & 0x8000)
-                demo.position[0] += deltaTime * demo.zoom;
-            else if (GetAsyncKeyState(VK_RIGHT) & 0x8000)
-                demo.position[0] -= deltaTime * demo.zoom;
-
-            if (GetAsyncKeyState(VK_UP) & 0x8000)
-                demo.position[1] -= deltaTime * demo.zoom;
-            if (GetAsyncKeyState(VK_DOWN) & 0x8000)
-                demo.position[1] += deltaTime * demo.zoom;
-
-            std::for_each(std::execution::par, std::begin(tiles), std::end(tiles), [&demo](uint32_t tileIndex)
-            {
-                uint32_t x0 = (tileIndex % k_NumTilesX) * k_TileSize;
-                uint32_t y0 = (tileIndex / k_NumTilesX) * k_TileSize;
-                uint32_t x1 = x0 + k_TileSize;
-                uint32_t y1 = y0 + k_TileSize;
-                uint8_t* displayPtr = demo.displayPtr;
-
-                __m256d xOffsets = _mm256_set_pd(3.0f, 2.0f, 1.0f, 0.0f);
-                __m256d rcpResX = _mm256_set1_pd(k_DemoRcpResolutionX);
-                __m256d aspectRatio = _mm256_set1_pd(k_DemoAspectRatio);
-                __m256d zoom = _mm256_broadcast_sd(&demo.zoom);
-                __m256d posX = _mm256_broadcast_sd(&demo.position[0]);
-
-                for (uint32_t y = y0; y < y1; ++y)
-                {
-                    double cy = 2.0 * (y * k_DemoRcpResolutionY - 0.5);
-                    cy = (cy * demo.zoom) - demo.position[1];
-                    __m256d vcy = _mm256_broadcast_sd(&cy);
-
-                    for (uint32_t x = x0; x < x1; x += 4)
-                    {
-                        // vcx = 2.0 * (x * k_DemoRcpResolutionX - 0.5) * k_DemoAspectRatio;
-                        double xd = (double)x;
-                        __m256d vcx = _mm256_add_pd(_mm256_broadcast_sd(&xd), xOffsets);
-                        vcx = _mm256_sub_pd(_mm256_mul_pd(vcx, rcpResX), s_0_5);
-                        vcx = _mm256_mul_pd(_mm256_add_pd(vcx, vcx), aspectRatio);
-
-                        // vcx = (vcx * demo.zoom) - demo.position[0];
-                        vcx = _mm256_sub_pd(_mm256_mul_pd(vcx, zoom), posX);
-
-                        __m256d d = ComputeDistance(vcx, vcy, 256);
-                        d = _mm256_sqrt_pd(_mm256_sqrt_pd(_mm256_div_pd(d, zoom)));
-                        d = _mm256_min_pd(d, s_1_0);
-
-                        alignas(32) double ds[4];
-                        _mm256_store_pd(ds, d);
-                        uint32_t idx = (x + y * k_DemoResolutionX) * 4;
-                        displayPtr[idx +  0] = (uint8_t)(255.0 * ds[0]);
-                        displayPtr[idx +  1] = (uint8_t)(255.0 * ds[0]);
-                        displayPtr[idx +  2] = (uint8_t)(255.0 * ds[0]);
-                        displayPtr[idx +  3] = 255;
-                        displayPtr[idx +  4] = (uint8_t)(255.0 * ds[1]);
-                        displayPtr[idx +  5] = (uint8_t)(255.0 * ds[1]);
-                        displayPtr[idx +  6] = (uint8_t)(255.0 * ds[1]);
-                        displayPtr[idx +  7] = 255;
-                        displayPtr[idx +  8] = (uint8_t)(255.0 * ds[2]);
-                        displayPtr[idx +  9] = (uint8_t)(255.0 * ds[2]);
-                        displayPtr[idx + 10] = (uint8_t)(255.0 * ds[2]);
-                        displayPtr[idx + 11] = 255;
-                        displayPtr[idx + 12] = (uint8_t)(255.0 * ds[3]);
-                        displayPtr[idx + 13] = (uint8_t)(255.0 * ds[3]);
-                        displayPtr[idx + 14] = (uint8_t)(255.0 * ds[3]);
-                        displayPtr[idx + 15] = 255;
-                    }
-                }
-            });
-
-            BitBlt(demo.windowDevCtx, 0, 0, k_DemoResolutionX, k_DemoResolutionY, demo.memoryDevCtx, 0, 0, SRCCOPY);
+            Draw(demo);
+            Present(demo);
         }
     }
 
